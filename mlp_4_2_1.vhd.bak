@@ -1,0 +1,169 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity mlp_4_2_1 is
+    Port ( 
+        clk      : in std_logic;
+        rst      : in std_logic;
+        -- Entradas: Vetor plano de 16 bits (4 entradas x 4 bits)
+        -- Ex: "0011 1111 0000 1010" são as 4 entradas
+        i_data   : in std_logic_vector(15 downto 0); 
+        
+        -- Saída Binária
+        o_result : out std_logic
+    );
+end mlp_4_2_1;
+
+architecture Behavioral of mlp_4_2_1 is
+
+    ------------------------------------------------------------------------
+    -- 1. DEFINIÇÃO DE TIPOS E CONSTANTES
+    ------------------------------------------------------------------------
+    -- Definimos larguras de bits para evitar overflow (estouro)
+    constant W_BITS : integer := 8;  -- Largura dos Pesos (8 bits é um bom balanço)
+    constant I_BITS : integer := 4;  -- Largura da Entrada
+    constant ACC_BITS : integer := 16; -- Acumulador (Soma de multiplicações precisa de espaço)
+
+    type t_input_array  is array (0 to 3) of signed(I_BITS-1 downto 0);
+    type t_weight_array is array (0 to 3) of signed(W_BITS-1 downto 0);
+    
+    -- Arrays para saídas das camadas
+    type t_L1_out is array (0 to 3) of signed(W_BITS-1 downto 0); -- Saída L1 truncada para 8 bits
+    type t_L2_out is array (0 to 1) of signed(W_BITS-1 downto 0); -- Saída L2 truncada para 8 bits
+
+    ------------------------------------------------------------------------
+    -- 2. ARMAZENAMENTO DOS PESOS (HARDCODED)
+    -- É aqui que você colocará os valores inteiros gerados pelo Python
+    ------------------------------------------------------------------------
+    
+    -- CAMADA 1: 4 Neurónios (Cada um tem 4 pesos + 1 Bias)
+    type t_layer1_weights is array (0 to 3) of t_weight_array;
+    constant W_L1 : t_layer1_weights := (
+        (to_signed(10,8), to_signed(-20,8), to_signed(5,8),  to_signed(2,8)), -- Neurónio 0
+        (to_signed(5,8),  to_signed(12,8),  to_signed(-5,8), to_signed(1,8)), -- Neurónio 1
+        (to_signed(-2,8), to_signed(3,8),   to_signed(15,8), to_signed(0,8)), -- Neurónio 2
+        (to_signed(8,8),  to_signed(-8,8),  to_signed(2,8),  to_signed(30,8)) -- Neurónio 3
+    );
+    -- Bias da Camada 1
+    type t_bias_L1 is array (0 to 3) of signed(W_BITS-1 downto 0);
+    constant B_L1 : t_bias_L1 := (to_signed(2,8), to_signed(-1,8), to_signed(0,8), to_signed(5,8));
+
+    -- CAMADA 2: 2 Neurónios (Recebem 4 entradas da camada anterior)
+    type t_layer2_weights is array (0 to 1) of t_weight_array; -- Nota: reuso t_weight_array pois L1 tem 4 saídas
+    constant W_L2 : t_layer2_weights := (
+        (to_signed(15,8), to_signed(-10,8), to_signed(2,8), to_signed(-1,8)), -- Neurónio 0
+        (to_signed(-5,8), to_signed(20,8),  to_signed(1,8), to_signed(10,8))  -- Neurónio 1
+    );
+    constant B_L2 : t_layer2_out := (to_signed(10,8), to_signed(-5,8)); -- Tipo compatível (t_L2_out tem size 2)
+
+    -- CAMADA DE SAÍDA: 1 Neurónio (Recebe 2 entradas da camada L2)
+    type t_out_weights is array (0 to 1) of signed(W_BITS-1 downto 0);
+    constant W_OUT : t_out_weights := (to_signed(40,8), to_signed(-30,8));
+    constant B_OUT : signed(W_BITS-1 downto 0) := to_signed(-5, 8);
+
+    ------------------------------------------------------------------------
+    -- 3. SINAIS INTERNOS
+    ------------------------------------------------------------------------
+    signal r_inputs : t_input_array; -- Registrador de entrada
+    signal r_output : std_logic;     -- Registrador de saída
+
+begin
+
+    -- Processo Principal Síncrono
+    process(clk)
+        -- Variáveis para cálculos temporários (soma de produtos)
+        variable v_acc      : signed(ACC_BITS-1 downto 0);
+        
+        -- Variáveis para armazenar resultados pós-ativação (ReLU)
+        variable v_L1_res   : t_L1_out;
+        variable v_L2_res   : t_L2_out;
+        variable v_final_acc: signed(ACC_BITS-1 downto 0);
+        
+    begin
+        if rising_edge(clk) then
+            if rst = '1' then
+                o_result <= '0';
+                -- Zerar registradores se necessário
+            else
+                ------------------------------------------------------------
+                -- ESTÁGIO 1: Captura das Entradas (Deserialização)
+                ------------------------------------------------------------
+                -- Divide o vetor de 16 bits em 4 pedaços de 4 bits
+                r_inputs(0) <= signed(i_data(3 downto 0));
+                r_inputs(1) <= signed(i_data(7 downto 4));
+                r_inputs(2) <= signed(i_data(11 downto 8));
+                r_inputs(3) <= signed(i_data(15 downto 12));
+
+                ------------------------------------------------------------
+                -- ESTÁGIO 2: Cálculo da Camada 1 (4 Neurónios)
+                ------------------------------------------------------------
+                for n in 0 to 3 loop -- Para cada neurónio
+                    v_acc := resize(B_L1(n), ACC_BITS); -- Começa com Bias
+                    
+                    for i in 0 to 3 loop -- Soma ponderada das 4 entradas
+                        v_acc := v_acc + (r_inputs(i) * W_L1(n)(i));
+                    end loop;
+
+                    -- Função de Ativação: ReLU
+                    if v_acc < 0 then
+                        v_L1_res(n) := (others => '0');
+                    else
+                        -- Truncamos o resultado de volta para 8 bits para a próxima camada
+                        -- Se o valor for muito alto, saturamos no máximo de 8 bits (127)
+                        if v_acc > 127 then
+                            v_L1_res(n) := to_signed(127, 8);
+                        else
+                            v_L1_res(n) := resize(v_acc, 8);
+                        end if;
+                    end if;
+                end loop;
+
+                ------------------------------------------------------------
+                -- ESTÁGIO 3: Cálculo da Camada 2 (2 Neurónios)
+                ------------------------------------------------------------
+                for n in 0 to 1 loop -- Para cada neurónio da camada 2
+                    v_acc := resize(B_L2(n), ACC_BITS);
+                    
+                    for i in 0 to 3 loop -- Recebe 4 saídas da L1
+                        v_acc := v_acc + (v_L1_res(i) * W_L2(n)(i));
+                    end loop;
+
+                    -- Função de Ativação: ReLU
+                    if v_acc < 0 then
+                        v_L2_res(n) := (others => '0');
+                    else
+                        if v_acc > 127 then
+                            v_L2_res(n) := to_signed(127, 8);
+                        else
+                            v_L2_res(n) := resize(v_acc, 8);
+                        end if;
+                    end if;
+                end loop;
+
+                ------------------------------------------------------------
+                -- ESTÁGIO 4: Camada de Saída (1 Neurónio)
+                ------------------------------------------------------------
+                v_final_acc := resize(B_OUT, ACC_BITS);
+                
+                for i in 0 to 1 loop -- Recebe 2 saídas da L2
+                    v_final_acc := v_final_acc + (v_L2_res(i) * W_OUT(i));
+                end loop;
+
+                -- Função de Ativação: Degrau (Step) para Saída Binária
+                if v_final_acc >= 0 then -- Limiar é 0
+                    r_output <= '1';
+                else
+                    r_output <= '0';
+                end if;
+
+                ------------------------------------------------------------
+                -- Atualiza Saída Física
+                ------------------------------------------------------------
+                o_result <= r_output;
+
+            end if;
+        end if;
+    end process;
+
+end Behavioral;
