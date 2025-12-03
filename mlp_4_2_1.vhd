@@ -8,74 +8,67 @@ entity mlp_4_2_1 is
     Port ( 
         clk      : in std_logic;
         rst      : in std_logic;
-        i_data   : in std_logic_vector(15 downto 0); -- 4 entradas de 4 bits
-        btn_inf  : in std_logic;
-		  
-        -- Saída original (LED de debug)
-        o_result : out std_logic;
-        
-        -- NOVAS SAÍDAS: Displays de 7 Segmentos
-        -- Conectam nas saídas d0..d4 do decoder
-        HEX0     : out std_logic_vector(6 downto 0);
-        HEX1     : out std_logic_vector(6 downto 0);
-        HEX2     : out std_logic_vector(6 downto 0);
-        HEX3     : out std_logic_vector(6 downto 0);
-        HEX4     : out std_logic_vector(6 downto 0)
+        -- 4 entradas de 4 bits cada (0 a 15) concatenadas
+        i_data   : in std_logic_vector(15 downto 0); 
+        o_result : out std_logic
     );
 end mlp_4_2_1;
 
 architecture Structural of mlp_4_2_1 is
 
-    -- Sinais internos para conectar as camadas
     signal r_inputs  : t_data_array(0 to 3);
     signal w_L1_out  : t_data_array(0 to 3);
     signal w_L2_out  : t_data_array(0 to 1);
     signal w_final   : t_data_array(0 to 0);
     
-    -- Este sinal carrega o resultado (0 ou 1) da MLP
     signal r_output  : std_logic;
 
-    ----------------------------------------------------------------
-    -- COMPONENTES
-    ----------------------------------------------------------------
-    
-    -- 1. Neurônio
     component neuron is
-        Generic (NUM_INPUTS : integer; USE_RELU : boolean);
+        Generic ( NUM_INPUTS : integer; USE_RELU : boolean );
         Port (
-            i_inputs  : in  t_data_array;
-            i_weights : in  t_weight_array;
-            i_bias    : in  signed;
-            o_output  : out signed
-        );
-    end component;
-
-    -- 2. Decodificador (Display)
-    component decoder is
-        port (
-            inf, class          : in std_logic;
-            d0, d1, d2, d3, d4  : out std_logic_vector(6 DOWNTO 0)
+            i_inputs  : in  t_data_array(0 to NUM_INPUTS-1);
+            i_weights : in  t_weight_array(0 to NUM_INPUTS-1);
+            i_bias    : in  signed(W_BITS-1 downto 0);
+            o_output  : out signed(W_BITS-1 downto 0)
         );
     end component;
 
 begin
 
     ----------------------------------------------------------------
-    -- PROCESSO DE ENTRADA/SAÍDA (REGISTRADORES)
+    -- PROCESSO DE ENTRADA PROPORCIONAL
     ----------------------------------------------------------------
     process(clk)
+        -- Variável temporária para ajudar na conversão
+        variable v_tmp : unsigned(W_BITS-1 downto 0);
     begin
         if rising_edge(clk) then
             if rst = '1' then
                 r_output <= '0';
+                r_inputs <= (others => (others => '0'));
             else
-                -- 1. Mapeia entrada
-                r_inputs(0) <= resize(signed(i_data(3 downto 0)), 8);
-                r_inputs(1) <= resize(signed(i_data(7 downto 4)), 8);
-                r_inputs(2) <= resize(signed(i_data(11 downto 8)), 8);
-                r_inputs(3) <= resize(signed(i_data(15 downto 12)), 8);
+                -- LÓGICA DE ESCALA:
+                -- Entrada (0..15) * 4 = (0..60). 
+                -- Onde 64 representaria 1.0. Então 15 vira "quase 100%".
+                -- Multiplicar por 4 é dar Shift Left de 2 bits.
+
+                -- Entrada 0 (bits 3-0)
+                v_tmp := resize(unsigned(i_data(3 downto 0)), W_BITS);
+                r_inputs(0) <= signed(shift_left(v_tmp, 2));
+
+                -- Entrada 1 (bits 7-4)
+                v_tmp := resize(unsigned(i_data(7 downto 4)), W_BITS);
+                r_inputs(1) <= signed(shift_left(v_tmp, 2));
+
+                -- Entrada 2 (bits 11-8)
+                v_tmp := resize(unsigned(i_data(11 downto 8)), W_BITS);
+                r_inputs(2) <= signed(shift_left(v_tmp, 2));
+
+                -- Entrada 3 (bits 15-12)
+                v_tmp := resize(unsigned(i_data(15 downto 12)), W_BITS);
+                r_inputs(3) <= signed(shift_left(v_tmp, 2));
                 
-                -- 2. Função Degrau (Threshold) na saída
+                -- Saída (Threshold)
                 if w_final(0) > 0 then
                     r_output <= '1';
                 else
@@ -85,14 +78,11 @@ begin
         end if;
     end process;
     
-    -- Conecta o resultado ao pino de saída simples (LED)
     o_result <= r_output;
 
     ----------------------------------------------------------------
-    -- INSTANCIAÇÃO DA REDE NEURAL (MLP)
+    -- CONEXÕES DOS NEURÔNIOS (Mantido igual)
     ----------------------------------------------------------------
-    
-    -- Camada 1
     GEN_L1: for i in 0 to 3 generate
         u_neuron_L1 : neuron
         generic map ( NUM_INPUTS => 4, USE_RELU => true )
@@ -104,7 +94,6 @@ begin
         );
     end generate;
 
-    -- Camada 2
     GEN_L2: for i in 0 to 1 generate
         u_neuron_L2 : neuron
         generic map ( NUM_INPUTS => 4, USE_RELU => true )
@@ -116,7 +105,6 @@ begin
         );
     end generate;
 
-    -- Camada de Saída
     GEN_OUT: for i in 0 to 0 generate
         u_neuron_OUT : neuron
         generic map ( NUM_INPUTS => 2, USE_RELU => false ) 
@@ -127,19 +115,5 @@ begin
             o_output  => w_final(i)
         );
     end generate;
-
-    ----------------------------------------------------------------
-    -- INSTANCIAÇÃO DO DECODIFICADOR (VISUALIZAÇÃO)
-    ----------------------------------------------------------------
-    u_decoder : decoder
-    port map (
-        inf   => btn_inf,      -- Habilitado constantemente (ou use 'not rst' se preferir)
-        class => r_output, -- O resultado da MLP controla o texto no display
-        d0    => HEX0,     -- Conecta às saídas da entidade topo
-        d1    => HEX1,
-        d2    => HEX2,
-        d3    => HEX3,
-        d4    => HEX4
-    );
 
 end Structural;
